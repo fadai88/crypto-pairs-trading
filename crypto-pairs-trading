@@ -1,0 +1,149 @@
+import aiohttp
+import asyncio
+import pandas as pd
+import numpy as np
+import datetime as dt
+import json
+import nest_asyncio
+from binance.client import Client
+import matplotlib.pyplot as plt
+from itertools import combinations
+
+
+# enter your API key and Secret key below.
+api_key = ''
+api_secret = ''
+
+# get all pairs from Binance excluding stablecoins and pegged assets
+pairs_binance = []
+client = Client(api_key, api_secret)
+exchange_info = client.get_exchange_info()
+stablecoins_and_pegged = ['USDC', 'TUSD', 'USDP', 'EUR', 'AEUR', 'FDUSD', 'DAI', 'USTC', 'WBTC', 'WBETH']
+for s in exchange_info['symbols']:
+    if s['symbol'][-4:] == 'USDT' and s['symbol'][:-4] not in stablecoins_and_pegged:
+        pairs_binance.append(s['symbol'])
+
+nest_asyncio.apply()
+
+async def fetch_data(session, url):
+    async with session.get(url) as response:
+        return await response.text()
+
+# store close prices in a dataframe
+async def create_df(data):
+    root_url = 'https://api.binance.com/api/v3/klines'
+    interval = '1h'
+    close_prices = pd.DataFrame()
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_data(session, f'{root_url}?symbol={symbol}&interval={interval}') for symbol in data]
+        responses = await asyncio.gather(*tasks)
+        
+        for symbol, response in zip(data, responses):
+            data = json.loads(response)
+            if 'msg' in data:
+                continue
+            df = pd.DataFrame(data, columns=['open_time', 'o', 'h', 'l', 'c', 'v', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
+            df.index = [dt.datetime.fromtimestamp(x / 1000.0) for x in df.close_time]
+            close_prices[symbol] = pd.to_numeric(df['c'])
+    
+    close_prices_cleaned = close_prices.dropna(axis=1)
+    return close_prices_cleaned
+
+# Run the asynchronous function in an existing event loop
+close_prices = asyncio.run(create_df(pairs_binance))
+
+# normalize prices by dividing into the first price
+def normalize(df):
+    return df / df.iloc[0]
+
+normalized_df = normalize(close_prices)
+
+# calculate ssd (sum of squared differences)
+def ssd(df):
+    return {f'{c1}-{c2}': np.sum((df[c1] - df[c2]) ** 2) for c1, c2 in combinations(df.columns, 2)}
+
+# split the price data into training and testing data
+split_index = int(len(normalized_df) * 2 / 3)
+training = normalized_df.iloc[:split_index]
+testing = normalized_df.iloc[split_index:]
+
+
+ssd_results = ssd(training)
+sorted_ssd = {k: v for k, v in sorted(ssd_results.items(), key=lambda item: item[1])}
+top10_pairs = list(sorted_ssd)[:10]
+
+def pairs_df(data, pair_list, threshold=2):
+    pairs_dict = {}
+    for pair in pair_list:
+        asset1, asset2 = pair.split('-')
+        pairs = pd.DataFrame({
+            'asset1': data[asset1],
+            'asset2': data[asset2]
+        })
+        pairs['asset1_returns'] = pairs['asset1'].pct_change(1).dropna()
+        pairs['asset2_returns'] = pairs['asset2'].pct_change(1).dropna()
+        pairs['diff'] = pairs['asset1'] - pairs['asset2']
+        pairs['z_score'] = (pairs['diff'] - pairs['diff'].mean()) / pairs['diff'].std()
+        
+        long_m1 = pairs['z_score'].lt(-threshold)
+        long_m2 = pairs['z_score'].gt(0)
+        pairs['long_positions'] = long_m1.where(long_m1|long_m2).ffill().fillna(False)
+        pairs['buy'] = pairs['long_positions'] & pairs['long_positions'].diff()
+        pairs['long_exit'] = long_m2 & pairs['long_positions'].shift()
+        pairs[['long_positions', 'buy', 'long_exit']] = pairs[['long_positions', 'buy', 'long_exit']].astype(int)
+        
+        short_m1 = pairs['z_score'].gt(threshold)
+        short_m2 = pairs['z_score'].lt(0)
+        pairs['short_positions'] = short_m1.where(short_m1|short_m2).ffill().fillna(False)
+        pairs['sell'] = pairs['short_positions'] & pairs['short_positions'].diff()
+        pairs['short_exit'] = short_m2 & pairs['short_positions'].shift()
+        pairs[['short_positions', 'sell', 'short_exit']] = pairs[['short_positions', 'sell', 'short_exit']].astype(int)
+
+        # change index from time to the range of integers. It makes it easier to refer to the index.
+        pairs['time'] = pairs.index
+        pairs.reset_index(drop=True, inplace=True)
+        pairs_dict[pair] = pairs
+    return pairs_dict
+pairs_dict = pairs_df(testing, top10_pairs, 2)
+
+# calculate the strategy return on testing data
+def strategy_return(data):
+    pnl = 0
+    for df in data.values():
+        long_entries = df[df['buy'] == 1].index
+        short_entries = df[df['sell'] == 1].index
+        for idx in long_entries:
+            exit_idx = df[(df.index > idx) & (df['long_exit'])].index
+            if not exit_idx.empty:
+                ret = (df['asset1'][exit_idx[0]] / df['asset1'][idx] - 1) + (1- df['asset2'][exit_idx[0]] / df['asset2'][idx])
+                pnl += ret
+        for idx in short_entries:
+            exit_idx = df[(df.index > idx) & (df['short_exit'])].index
+            if not exit_idx.empty:
+                ret = (1- df['asset1'][exit_idx[0]] / df['asset1'][idx]) + (df['asset2'][exit_idx[0]] / df['asset2'][idx] - 1)
+                pnl += ret
+        #print(pnl)
+    return pnl
+testing_data_return = strategy_return(pairs_dict)
+print("testing data return is " + "{:.2%}".format(testing_data_return))
+
+# calculate the strategy return on rolling basis
+def rolling_pairs_trading(data, lookback=100):
+    strategy_returns = 0
+    for i in range(lookback, len(data), lookback):
+        partial_df = data.iloc[i-lookback:i]
+        normalized_partial_df = normalize(partial_df)
+        split_index = int(len(normalized_partial_df) * 2 / 3)
+        training_data = normalized_partial_df.iloc[:split_index]
+        testing_data = normalized_partial_df.iloc[split_index:]
+        ssd_results = ssd(training_data)
+        sorted_ssd = {k: v for k, v in sorted(ssd_results.items(), key=lambda item: item[1])}
+        top10_pairs = list(sorted_ssd)[:10]
+        
+        rolling_pairs_dict = pairs_df(testing_data, top10_pairs, threshold=2)
+        strategy_returns += strategy_return(rolling_pairs_dict)
+    return strategy_returns
+
+pairs_trading_rolling_return = rolling_pairs_trading(close_prices, lookback=100)
+print("rolling based return is " + "{:.2%}".format(pairs_trading_rolling_return))
