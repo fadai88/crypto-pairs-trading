@@ -1,4 +1,4 @@
-# crypto-pairs-trading
+# Crypto pairs trading. Distance approach
 There are several approaches to pairs trading. Distance method is one of most popular ones among them. Its basic idea is simple and intuitive. First, we split price data into formation and trading periods. The next step is to normalize prices. Then employing Euclidian distance on the normalized price data, we select asset pairs with the least SSD (sum of squared differences). Mathematically it can be expressed as
 ![image](https://github.com/fadai88/crypto-pairs-trading/assets/12747028/9f36c49c-e1d5-4690-8f56-9b7d55d3308e)
 
