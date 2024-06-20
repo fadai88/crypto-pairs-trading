@@ -9,12 +9,10 @@ from binance.client import Client
 import matplotlib.pyplot as plt
 from itertools import combinations
 
-
-# enter your API key and Secret key below.
+# Put your API key and Secret key into the variables below.
 api_key = ''
 api_secret = ''
 
-# get all pairs from Binance excluding stablecoins and pegged assets
 pairs_binance = []
 client = Client(api_key, api_secret)
 exchange_info = client.get_exchange_info()
@@ -29,7 +27,6 @@ async def fetch_data(session, url):
     async with session.get(url) as response:
         return await response.text()
 
-# store close prices in a dataframe
 async def create_df(data):
     root_url = 'https://api.binance.com/api/v3/klines'
     interval = '1h'
@@ -53,25 +50,30 @@ async def create_df(data):
 # Run the asynchronous function in an existing event loop
 close_prices = asyncio.run(create_df(pairs_binance))
 
-# normalize prices by dividing into the first price
 def normalize(df):
     return df / df.iloc[0]
 
-normalized_df = normalize(close_prices)
+split_index = int(len(close_prices) * 2 / 3)
+training = normalize(close_prices[:split_index])
+testing = normalize(close_prices[split_index:])
 
-# calculate ssd (sum of squared differences)
 def ssd(df):
     return {f'{c1}-{c2}': np.sum((df[c1] - df[c2]) ** 2) for c1, c2 in combinations(df.columns, 2)}
-
-# split the price data into training and testing data
-split_index = int(len(normalized_df) * 2 / 3)
-training = normalized_df.iloc[:split_index]
-testing = normalized_df.iloc[split_index:]
-
 
 ssd_results = ssd(training)
 sorted_ssd = {k: v for k, v in sorted(ssd_results.items(), key=lambda item: item[1])}
 top10_pairs = list(sorted_ssd)[:10]
+
+# visualize a pair
+pair = top10_pairs[0]
+asset1, asset2 = pair.split('-')
+training_time = training.index
+plt.plot(training_time, training[asset1], label=asset1)
+plt.plot(training_time, training[asset2], label=asset2)
+# Add a legend
+plt.legend()
+# Display the plot
+plt.show()
 
 def pairs_df(data, pair_list, threshold=2):
     pairs_dict = {}
@@ -81,8 +83,6 @@ def pairs_df(data, pair_list, threshold=2):
             'asset1': data[asset1],
             'asset2': data[asset2]
         })
-        pairs['asset1_returns'] = pairs['asset1'].pct_change(1).dropna()
-        pairs['asset2_returns'] = pairs['asset2'].pct_change(1).dropna()
         pairs['diff'] = pairs['asset1'] - pairs['asset2']
         pairs['z_score'] = (pairs['diff'] - pairs['diff'].mean()) / pairs['diff'].std()
         
@@ -107,7 +107,6 @@ def pairs_df(data, pair_list, threshold=2):
     return pairs_dict
 pairs_dict = pairs_df(testing, top10_pairs, 2)
 
-# calculate the strategy return on testing data
 def strategy_return(data):
     pnl = 0
     for df in data.values():
@@ -123,27 +122,6 @@ def strategy_return(data):
             if not exit_idx.empty:
                 ret = (1- df['asset1'][exit_idx[0]] / df['asset1'][idx]) + (df['asset2'][exit_idx[0]] / df['asset2'][idx] - 1)
                 pnl += ret
-        #print(pnl)
     return pnl
 testing_data_return = strategy_return(pairs_dict)
 print("testing data return is " + "{:.2%}".format(testing_data_return))
-
-# calculate the strategy return on rolling basis
-def rolling_pairs_trading(data, lookback=100):
-    strategy_returns = 0
-    for i in range(lookback, len(data), lookback):
-        partial_df = data.iloc[i-lookback:i]
-        normalized_partial_df = normalize(partial_df)
-        split_index = int(len(normalized_partial_df) * 2 / 3)
-        training_data = normalized_partial_df.iloc[:split_index]
-        testing_data = normalized_partial_df.iloc[split_index:]
-        ssd_results = ssd(training_data)
-        sorted_ssd = {k: v for k, v in sorted(ssd_results.items(), key=lambda item: item[1])}
-        top10_pairs = list(sorted_ssd)[:10]
-        
-        rolling_pairs_dict = pairs_df(testing_data, top10_pairs, threshold=2)
-        strategy_returns += strategy_return(rolling_pairs_dict)
-    return strategy_returns
-
-pairs_trading_rolling_return = rolling_pairs_trading(close_prices, lookback=100)
-print("rolling based return is " + "{:.2%}".format(pairs_trading_rolling_return))
