@@ -117,10 +117,18 @@ def strategy_return(data):
             if not exit_idx.empty:
                 ret = (df['asset1'][exit_idx[0]] / df['asset1'][idx] - 1) + (1- df['asset2'][exit_idx[0]] / df['asset2'][idx])
                 pnl += ret
+            # if there is no mean reversion until the end of period, we close the position.
+            else:
+                ret = (df['asset1'].iloc[-1] / df['asset1'][idx] - 1) + (1- df['asset2'].iloc[-1] / df['asset2'][idx])
+                pnl += ret 
         for idx in short_entries:
             exit_idx = df[(df.index > idx) & (df['short_exit'])].index
             if not exit_idx.empty:
                 ret = (1- df['asset1'][exit_idx[0]] / df['asset1'][idx]) + (df['asset2'][exit_idx[0]] / df['asset2'][idx] - 1)
+                pnl += ret
+            # if there is no mean reversion until the end of period, we close the position.
+            else:
+                ret = (1- df['asset1'].iloc[-1] / df['asset1'][idx]) + (df['asset2'].iloc[-1] / df['asset2'][idx] - 1)
                 pnl += ret
     return pnl
 testing_data_return = strategy_return(pairs_dict)
