@@ -1,0 +1,241 @@
+import pandas as pd
+import numpy as np
+import datetime as dt
+import matplotlib.pyplot as plt
+from heapq import nsmallest
+from itertools import combinations
+from datetime import datetime, timedelta
+
+close_prices = pd.read_excel("funding_rates_mark_prices.xlsx", sheet_name="mark_prices")
+close_prices.set_index("Date", inplace=True)
+# delete non-usdt perps
+close_prices = close_prices[[col for col in close_prices.columns if col.endswith('USDT')]]
+
+
+def normalize(df, min_vals, max_vals):
+    return (df - min_vals) / (max_vals - min_vals)
+
+def calculate_ssd(df):
+    filtered_df = df.dropna(axis=1)
+    return {f'{c1}-{c2}': np.sum((filtered_df[c1] - df[c2]) ** 2) for c1, c2 in combinations(filtered_df.columns, 2)}
+
+def top_ten_pairs(df, start, end):
+    ssd_results_dict = calculate_ssd(df)
+    sorted_ssd_dict = dict(sorted(ssd_results_dict.items(), key=lambda item: item[1]))
+    most_similar_pairs = {}
+    coins = set()
+    for pair, ssd in sorted_ssd_dict.items():
+        coin1, coin2 = pair.split('-')
+        if coin1 not in coins and coin2 not in coins:
+            most_similar_pairs[coin1] = (pair, ssd)
+            coins.add(coin1)
+            coins.add(coin2)
+            if len(most_similar_pairs) == 10:
+                break
+      
+    sorted_ssd = dict(sorted(most_similar_pairs.items(), key=lambda item: item[1][1]))
+    top10_pairs = list(sorted_ssd.values())[:10]
+    return top10_pairs
+
+
+# once 10 pairs are selected, we can trade them.
+def get_trading_data(start, end, trading_period):
+    date_format = "%Y-%m-%d"
+    next_day = datetime.strptime(end, date_format) + timedelta(days=1)
+    entry_date = next_day.strftime(date_format)
+    two_weeks_later = datetime.strptime(entry_date, date_format) + timedelta(days=trading_period)
+    exit_date = two_weeks_later.strftime(date_format)
+    trading_data = close_prices[entry_date:exit_date]
+    return trading_data
+
+def pairs_df(formation_data, trading_data, pair_list, threshold=2):
+    pairs_dict = {}
+    for pair in pair_list:
+        asset1, asset2 = pair[0].split('-')
+        pairs = pd.DataFrame({
+            asset1: trading_data[asset1],
+            asset2: trading_data[asset2]
+        })
+        formation_diff_mean = (formation_data[asset1] - formation_data[asset2]).mean()
+        formation_diff_std =  (formation_data[asset1] - formation_data[asset2]).std()
+        pairs['diff'] = pairs[asset1] - pairs[asset2]
+        pairs['z_score'] = (pairs['diff'] - formation_diff_mean) / formation_diff_std
+        z_score = pairs['z_score']
+
+        long_m1 = z_score < -2
+        long_m2 = z_score > 0
+        long_positions = np.zeros_like(z_score, dtype =bool)
+        long_positions[long_m1] = True
+        for i in range(1,len(long_positions)):
+            if long_positions[i-1]: 
+                long_positions[i] = True
+            if long_m2[i]:
+                long_positions[i] = False
+        pairs['long_positions'] = long_positions.astype(int)
+
+        buy = np.zeros_like(z_score, dtype=bool)
+        if long_m1[0]:
+            buy[0] = 1
+        buy[1:] = long_positions[1:] & ~long_positions[:-1]
+        #Or sell[1:] = m1[1:] & ~positions[:-1]
+        buy = buy.astype(int)
+        pairs['buy'] = buy
+
+        long_exit = np.zeros_like(z_score, dtype=bool)
+        long_exit[1:] = long_m2[1:] & long_positions[:-1]
+        long_exit = long_exit.astype(int)
+        pairs['long_exit'] = long_exit
+
+
+        short_m1 = z_score > 2 
+        short_m2 = z_score < 0
+        short_positions = np.zeros_like(z_score, dtype =bool)
+        short_positions[short_m1] = True
+        for i in range(1,len(short_positions)):
+            if short_positions[i-1] : 
+                short_positions[i] = True
+            if short_m2[i] : 
+                short_positions[i] = False
+        pairs['short_positions'] = short_positions.astype(int)
+
+        sell = np.zeros_like(z_score, dtype=bool)
+        if short_m1[0]:
+            sell[0] = 1
+        sell[1:] = short_positions[1:] & ~short_positions[:-1]
+        #Or sell[1:] = m1[1:] & ~positions[:-1]
+        sell = sell.astype(int)
+        pairs['sell'] = sell
+
+        short_exit = np.zeros_like(z_score, dtype=bool)
+        short_exit[1:] = short_m2[1:] & short_positions[:-1]
+        short_exit = short_exit.astype(int)
+        pairs['short_exit'] = short_exit
+        
+        pairs['time'] = pairs.index
+        pairs.reset_index(drop=True, inplace=True)
+        pairs_dict[pair[0]] = pairs
+    return pairs_dict
+
+def strategy_return(data, commission = 0.001):
+    pnl = 0
+    for df in data.values():
+        long_entries = df[df['buy'] == 1].index
+        short_entries = df[df['sell'] == 1].index
+        for idx in long_entries:
+            exit_idx = df[(df.index > idx) & (df['long_exit'])].index
+            long = df.columns[0]
+            short = df.columns[1]
+            long_entry_price = close_prices[long][df.loc[idx]['time']] * (1 + commission)
+            short_entry_price = close_prices[short][df.loc[idx]['time']] * (1 - commission)
+            if not exit_idx.empty:
+                long_exit_price = close_prices[long][df.loc[exit_idx[0]]['time']] * (1 - commission)
+                short_exit_price = close_prices[short][df.iloc[exit_idx[0]]['time']] * (1 + commission)
+                ret = (long_exit_price / long_entry_price - short_exit_price / short_entry_price) / 2
+                pnl += ret
+            # if there is no mean reversion until the end of period, we close the position.
+            else:
+                long_exit_price = close_prices[long][df.iloc[-1]['time']] * (1 - commission)
+                short_exit_price = close_prices[short][df.iloc[-1]['time']] * (1 + commission)
+                ret = (long_exit_price / long_entry_price - short_exit_price / short_entry_price) / 2
+                pnl += ret
+        for idx in short_entries:
+            exit_idx = df[(df.index > idx) & (df['short_exit'])].index
+            long = df.columns[1]
+            short = df.columns[0]
+            long_entry_price = close_prices[long][df.loc[idx]['time']] * (1 + commission)
+            short_entry_price = close_prices[short][df.loc[idx]['time']] * (1 - commission)
+            if not exit_idx.empty:
+                long_exit_price = close_prices[long][df.loc[exit_idx[0]]['time']] * (1 - commission)
+                short_exit_price = close_prices[short][df.iloc[exit_idx[0]]['time']] * (1 + commission)
+                ret = (long_exit_price / long_entry_price - short_exit_price / short_entry_price) / 2
+                pnl += ret
+            # if there is no mean reversion until the end of period, we close the position.
+            else:
+                # short asset1, long asset2 when the position is forcefully closed
+                long_exit_price = close_prices[long][df.iloc[-1]['time']] * (1 - commission)
+                short_exit_price = close_prices[short][df.iloc[-1]['time']] * (1 + commission)
+                ret = (long_exit_price / long_entry_price - short_exit_price / short_entry_price) / 2
+                pnl += ret
+    return pnl / 10
+
+def rolling_pairs_trading(data, lookback=90, holding=45):
+    strategy_returns = []
+    date_format = "%Y-%m-%d"
+    for i in range(lookback, len(data), holding):
+        start = data.index[i-lookback].strftime(date_format)
+        end = close_prices.index[i].strftime(date_format)
+        formation_data = data[start:end]
+        min_vals = formation_data.min(skipna=True)
+        max_vals = formation_data.max(skipna=True)
+        normalized_formation_data = normalize(formation_data, min_vals, max_vals)
+        
+        trading_data = get_trading_data(start, end, holding)
+        # to avoid look-ahead bias, trading period should be normalized based on formation period values.
+        normalized_trading_data = normalize(trading_data, min_vals, max_vals)
+        
+        top10_pairs_list = top_ten_pairs(normalized_formation_data, start, end)
+        rolling_pairs_dict = pairs_df(normalized_formation_data, normalized_trading_data, top10_pairs_list, threshold=2)
+        strategy_returns.append(strategy_return(rolling_pairs_dict))
+    return strategy_returns
+results = rolling_pairs_trading(close_prices, lookback=90, holding=45)
+
+
+def annualied_geometric_return(returns): 
+    returns = [i + 1 for i in returns]
+    cumulative_returns = np.cumprod(returns)
+    geometric_return = cumulative_returns[-1] ** (1/len(cumulative_returns)) - 1
+    # annualized_return = (1 + geometric_return) ** 12 -1
+    annualized_return = (1 + geometric_return) ** (365/45) -1
+    return annualized_return
+annualized_return = annualied_geometric_return(results)
+print("Annual return is " + "{:.2%}".format(annualized_return))
+
+
+
+# Plot results
+# Ensure month_end_range is a DatetimeIndex
+#month_end_range = pd.date_range('1-Mar-2021','1-Jul-2024', freq='3ME').strftime("%Y-%m-%d").tolist()
+month_end_range = pd.date_range(start='2021-04-01', end='2024-06-30', freq='45D')
+month_end_range_index = pd.to_datetime(month_end_range)
+
+# Create the returns Series
+returns = pd.Series(results, index=month_end_range_index)
+cumulative_returns = (1 + returns).cumprod()
+
+plt.figure(figsize=(14, 7))
+plt.plot(cumulative_returns, label='Crypto pairs trading')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.legend()
+plt.title('Crypto Pairs Trading Performance')
+plt.show()
+
+
+def calculate_max_drawdown(returns):
+    returns = [i+1 for i in returns]
+    cumulative_returns = np.cumprod(returns)
+    peak = np.maximum.accumulate(cumulative_returns)
+    drawdown = (cumulative_returns - peak) / peak
+    max_drawdown = np.min(drawdown)
+    return max_drawdown
+max_drawdown = calculate_max_drawdown(results)
+print("Maximum Drawdown:", "{:.2%}".format(max_drawdown))
+
+# there are 3.5 years between start and end dates
+btc_return = (close_prices['BTCUSDT'][-1] / close_prices['BTCUSDT'][0]) ** (1/3.5) - 1
+btc_return_series = close_prices['BTCUSDT'].pct_change().dropna()
+print("BTC annual return is " + "{:.2%}".format(btc_return))
+max_drawdown_btc = calculate_max_drawdown(btc_return_series)
+print("Maximum Drawdown of BTC:", "{:.2%}".format(max_drawdown_btc))
+
+def calculate_sharpe_ratio(returns): 
+    # this should not be constant but should be calculated from yfinance. Can be taken from bab.py file.
+    annual_risk_free_rate = 0.02
+    weekly_risk_free_rate = (1 + annual_risk_free_rate)**(1/26) - 1
+    average_return = np.mean(returns)    
+    std_dev_returns = np.std(returns, ddof=1)
+    excess_return = average_return - weekly_risk_free_rate    
+    sharpe_ratio = excess_return / std_dev_returns
+    return sharpe_ratio
+sharpe_ratio = calculate_sharpe_ratio(results)
+print(f"Sharpe Ratio: {sharpe_ratio:.4f}")
